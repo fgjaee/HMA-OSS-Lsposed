@@ -53,7 +53,6 @@ import org.frknkrc44.hma_oss.zygote.util.Logcat.logW
 import org.frknkrc44.hma_oss.zygote.util.Logcat.logWithLevel
 import org.frknkrc44.hma_oss.zygote.util.PackageManagerUtils.findApp
 import org.frknkrc44.hma_oss.zygote.util.PackageManagerUtils.getLaunchIntentForPackageAsUser
-import org.frknkrc44.hma_oss.zygote.util.PackageManagerUtils.isConflictingModuleInstalled
 import org.frknkrc44.hma_oss.zygote.util.ServiceUtils.findAndVerifyAppSignature
 import rikka.hidden.compat.ActivityManagerApis
 import rikka.hidden.compat.UserManagerApis
@@ -98,12 +97,9 @@ class HMAService(val pms: IPackageManager, val pmn: Any?) : IHMAService.Stub() {
         private set
 
     init {
-        managerWorkMode = if (pms.isConflictingModuleInstalled()) {
-            logE(TAG) { "Conflicting module detected, skipping hook" }
-            Constants.MANAGER_WORK_MODE_NO_HOOKS
-        } else {
-            Constants.MANAGER_WORK_MODE_LOADING
-        }
+        // Installed manager APKs do not prove that another backend has hooked
+        // system_server. Keep conflict diagnostics separate from hook startup.
+        managerWorkMode = Constants.MANAGER_WORK_MODE_LOADING
 
         searchDataDir()
         saveModuleStatus()
@@ -116,7 +112,7 @@ class HMAService(val pms: IPackageManager, val pmn: Any?) : IHMAService.Stub() {
         if (managerWorkMode != Constants.MANAGER_WORK_MODE_NO_HOOKS) {
             installHooks()
 
-            if (hooker.hooksWasCrashed) {
+            if (hooker.hooksWasCrashed && !hooker.canContinueAfterHookFailure) {
                 managerWorkMode = Constants.MANAGER_WORK_MODE_CRASHED
             } else {
                 AppPresets.instance.loggerFunction = { level, msg ->
@@ -124,7 +120,11 @@ class HMAService(val pms: IPackageManager, val pmn: Any?) : IHMAService.Stub() {
                 }
                 loadPresetCache()
 
-                managerWorkMode = Constants.MANAGER_WORK_MODE_OK
+                managerWorkMode = if (hooker.hooksWasCrashed) {
+                    Constants.MANAGER_WORK_MODE_PARTIAL
+                } else {
+                    Constants.MANAGER_WORK_MODE_OK
+                }
             }
 
             saveModuleStatus()
@@ -782,10 +782,31 @@ class HMAService(val pms: IPackageManager, val pmn: Any?) : IHMAService.Stub() {
 
         val dataFile = getDataFile() ?: return false
 
-        val bytes = dataFile.readBytes()
-        configFile.writeBytes(bytes)
-
-        return true
+        return runCatching {
+            synchronized(configLock) {
+                val bytes = dataFile.readBytes()
+                // The source may be from an older fork; do not overwrite a valid
+                // current config with a file that this backend cannot deserialize.
+                JsonConfig.parse(bytes.decodeToString())
+                val staged = File(configFile.parentFile, configFile.name + ".migration.tmp")
+                try {
+                    staged.writeBytes(bytes)
+                    try {
+                        Files.move(staged.toPath(), configFile.toPath(),
+                            StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
+                    } catch (_: java.nio.file.AtomicMoveNotSupportedException) {
+                        Files.move(staged.toPath(), configFile.toPath(),
+                            StandardCopyOption.REPLACE_EXISTING)
+                    }
+                } finally {
+                    staged.delete()
+                }
+            }
+            true
+        }.getOrElse {
+            logE(TAG, it) { "Unable to import the old HMA configuration" }
+            false
+        }
     }
 
     override fun reloadConfigFromFile() {

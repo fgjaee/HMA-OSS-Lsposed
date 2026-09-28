@@ -28,6 +28,7 @@ import icu.nullptr.hidemyapplist.common.Constants
 import icu.nullptr.hidemyapplist.data.fetchLatestUpdate
 import icu.nullptr.hidemyapplist.service.PrefManager
 import icu.nullptr.hidemyapplist.service.ServiceClient
+import icu.nullptr.hidemyapplist.util.ConflictModuleDetector
 import icu.nullptr.hidemyapplist.ui.util.ThemeUtils.attrDrawable
 import icu.nullptr.hidemyapplist.ui.util.ThemeUtils.getColor
 import icu.nullptr.hidemyapplist.ui.util.ThemeUtils.homeItemBackgroundColor
@@ -53,6 +54,7 @@ import kotlin.concurrent.thread
  */
 class HomeFragment : Fragment(R.layout.fragment_home) {
     private val binding by viewBinding(FragmentHomeBinding::bind)
+    private var conflictedApps: List<ConflictModuleDetector.Finding> = emptyList()
 
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         with(binding.toolbar) {
@@ -101,6 +103,13 @@ class HomeFragment : Fragment(R.layout.fragment_home) {
         super.onStart()
 
         waitForService()
+        viewLifecycleOwner.lifecycleScope.launch {
+            val appContext = requireContext().applicationContext
+            conflictedApps = withContext(Dispatchers.IO) {
+                ConflictModuleDetector.detect(appContext)
+            }
+            updateConflictNotice()
+        }
 
         with(binding.howToUse.root.parent as ViewGroup) {
             val childCount = childCount
@@ -309,11 +318,13 @@ class HomeFragment : Fragment(R.layout.fragment_home) {
 
         val isWorking = serviceVersion > 0 && workMode != Constants.MANAGER_WORK_MODE_UNKNOWN
         val isCrashed = workMode == Constants.MANAGER_WORK_MODE_CRASHED
+        val isPartial = workMode == Constants.MANAGER_WORK_MODE_PARTIAL
         val isNoHooks = isCrashed || workMode == Constants.MANAGER_WORK_MODE_NO_HOOKS
 
         var color = when {
             !isWorking -> getColor(R.color.invalid)
             isNoHooks -> getColor(R.color.md_theme_material_amber_light_error)
+            isPartial -> getColor(R.color.md_theme_material_amber_light_error)
             else -> themeColor(android.R.attr.colorPrimary)
         }
 
@@ -329,18 +340,26 @@ class HomeFragment : Fragment(R.layout.fragment_home) {
                     val colorError = ColorStateList.valueOf(
                         getColor(R.color.md_theme_material_amber_dark_error))
 
-                    moduleStatus.setText(R.string.sick_mode_title)
+                    moduleStatus.setText(if (isCrashed) {
+                        R.string.hook_installation_failed_title
+                    } else {
+                        R.string.sick_mode_title
+                    })
                     moduleStatus.setTextColor(colorError)
                     setStatusIcon(R.drawable.sick_24px)
-                    serviceStatus.setText(R.string.sick_mode_description)
+                    serviceStatus.text = getString(if (isCrashed) {
+                        R.string.hook_installation_failed_description
+                    } else {
+                        R.string.sick_mode_description
+                    }) + "\n" + getString(
+                        R.string.backend_diagnostic_details,
+                        ServiceClient.serviceVersionName ?: "?",
+                        ServiceClient.backend ?: "?",
+                        workMode,
+                    )
                     serviceStatus.setTextColor(colorError)
                     filterCount.isVisible = false
 
-                    migrateBtn.isVisible = !isCrashed
-                    @Suppress("DEPRECATION")
-                    migrateBtn.setOnClickListener {
-                        navigate(R.id.nav_fix_issue)
-                    }
                 } else {
                     val image = when(workMode) {
                         Constants.MANAGER_WORK_MODE_LOADING -> R.drawable.sentiment_stressed_24px
@@ -364,7 +383,7 @@ class HomeFragment : Fragment(R.layout.fragment_home) {
                                     "xposed" -> "Xposed" + (ServiceClient.backendApiVersion?.let { " $it" } ?: "")
                                     "zygisk" -> "Zygisk"
                                     else -> "?"
-                                }
+                                } + if (isPartial) "\n" + getString(R.string.conflict_partial_hooks) else ""
                     filterCount.visibility = View.VISIBLE
                     filterCount.text =
                         getString(R.string.home_xposed_filter_count, ServiceClient.filterCount)
@@ -389,6 +408,31 @@ class HomeFragment : Fragment(R.layout.fragment_home) {
         binding.navLogs.root.isVisible = isWorking // allow taking logs on NO_HOOKS or CRASHED status
         binding.navSettings.root.isVisible = isHooks
         (binding.backupConfig.parent as ViewGroup).isVisible = isHooks
+        updateConflictNotice()
+    }
+
+    private fun updateConflictNotice() {
+        val notice = binding.conflictCard
+        notice.root.isVisible = conflictedApps.isNotEmpty()
+        if (conflictedApps.isEmpty()) return
+
+        notice.conflictSummary.text = conflictedApps.joinToString("\n") { finding ->
+            val message = when (finding.state) {
+                ConflictModuleDetector.State.INSTALLED_ONLY -> R.string.conflict_installed_only
+                ConflictModuleDetector.State.NOT_ENABLED_FOR_SYSTEM -> R.string.conflict_inactive
+                ConflictModuleDetector.State.POTENTIAL_CONFLICT -> R.string.conflict_potential
+            }
+            getString(message, finding.label)
+        }
+
+        // This is an optional migration action, independent of the working
+        // module status. An installed APK never blocks the backend.
+        val mode = ServiceClient.managerWorkMode
+        val serviceAvailable = ServiceClient.serviceVersion > 0 &&
+            mode != Constants.MANAGER_WORK_MODE_UNKNOWN &&
+            mode != Constants.MANAGER_WORK_MODE_CRASHED
+        notice.migrateBtn.isVisible = serviceAvailable
+        notice.migrateBtn.setOnClickListener { navigate(R.id.nav_fix_issue) }
     }
 
     private fun setStatusIcon(@DrawableRes res: Int) {
