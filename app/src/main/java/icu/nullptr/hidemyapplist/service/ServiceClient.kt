@@ -13,7 +13,7 @@ import java.lang.reflect.InvocationHandler
 import java.lang.reflect.Method
 import java.lang.reflect.Proxy
 
-object ServiceClient : IHMAService, IBinder.DeathRecipient {
+object ServiceClient : IHMAService {
 
     private const val TAG = "ServiceClient"
 
@@ -29,18 +29,59 @@ object ServiceClient : IHMAService, IBinder.DeathRecipient {
     @Volatile
     private var service: IHMAService? = null
 
-    fun linkService(binder: IBinder) {
-        service = Proxy.newProxyInstance(
+    private var activeBinder: IBinder? = null
+    private var deathRecipient: IBinder.DeathRecipient? = null
+
+    @Volatile
+    var backend: String? = null
+        private set
+
+    @Volatile
+    var backendApiVersion: Int? = null
+        private set
+
+    @Synchronized
+    fun linkService(binder: IBinder, backendName: String = "zygisk", apiVersion: Int? = null) {
+        if (activeBinder === binder && service != null) {
+            backend = backendName
+            backendApiVersion = apiVersion
+            return
+        }
+
+        val nextService = Proxy.newProxyInstance(
             javaClass.classLoader,
             arrayOf(IHMAService::class.java),
             ServiceProxy(IHMAService.Stub.asInterface(binder))
         ) as IHMAService
-        binder.linkToDeath(this, 0)
-    }
 
-    override fun binderDied() {
-        service = null
-        Log.e(TAG, "Binder died")
+        val recipient = IBinder.DeathRecipient {
+            val wasActive = synchronized(this) {
+                if (activeBinder !== binder) false else {
+                    service = null
+                    backend = null
+                    backendApiVersion = null
+                    activeBinder = null
+                    deathRecipient = null
+                    true
+                }
+            }
+            if (wasActive) Log.e(TAG, "Binder died")
+        }
+        binder.linkToDeath(recipient, 0)
+
+        val oldBinder = activeBinder
+        val oldRecipient = deathRecipient
+        // Publish the label before the volatile service reference: the UI polls
+        // serviceVersion and must not observe a new service with stale metadata.
+        backend = backendName
+        backendApiVersion = apiVersion
+        activeBinder = binder
+        deathRecipient = recipient
+        service = nextService
+        if (oldBinder != null && oldRecipient != null) {
+            runCatching { oldBinder.unlinkToDeath(oldRecipient, 0) }
+        }
+        Log.i(TAG, "Connected backend: $backendName")
     }
 
     override fun asBinder() = service?.asBinder()
