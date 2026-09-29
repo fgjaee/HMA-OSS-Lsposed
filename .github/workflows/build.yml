@@ -25,6 +25,19 @@ jobs:
     - name: Grant execute permission for gradlew
       run: chmod +x gradlew
 
+    - name: Create local.properties dummy file
+      run: |
+        cat > local.properties << EOF
+        officialBuild=false
+        crowdinProjectId=
+        crowdinApiKey=
+        fileDir=
+        storePassword=
+        keyAlias=
+        keyPassword=
+        localBuild=false
+        EOF
+
     - name: Build Debug APK with Gradle
       run: ./gradlew assembleDebug
 
