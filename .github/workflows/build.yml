@@ -38,6 +38,9 @@ jobs:
         localBuild=false
         EOF
 
+    - name: Fix hardcoded Git branch reference
+      run: git update-ref refs/remotes/origin/master HEAD
+
     - name: Build Debug APK with Gradle
       run: ./gradlew assembleDebug
 
